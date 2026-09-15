@@ -1,0 +1,6 @@
+{
+  "name": "Job Eligibility Checker",
+  "description": "Production-grade career analysis and job eligibility assessment platform.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
