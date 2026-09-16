@@ -3,44 +3,141 @@ import { JOB_ROLES } from '../data/rolesData';
 
 /**
  * Backend API Client configuration.
- * When a Python backend (e.g., FastAPI or Flask) is deployed,
- * set VITE_PYTHON_API_URL in .env to connect directly.
+ * Uses VITE_PYTHON_API_URL if configured, safely falling back to the production Render deployment.
  */
-const PYTHON_API_URL = import.meta.env.VITE_PYTHON_API_URL || '';
+export const DEFAULT_PYTHON_BACKEND_URL = 'https://job-eligibility-checker-backend.onrender.com';
+
+/**
+ * Safely resolves the API base URL without trailing slashes.
+ */
+export function getBaseApiUrl(): string {
+  const envUrl = 
+    (typeof import.meta !== 'undefined' && import.meta.env?.VITE_PYTHON_API_URL) ||
+    (typeof process !== 'undefined' && process.env?.VITE_PYTHON_API_URL);
+  if (typeof envUrl === 'string' && envUrl.trim().length > 0) {
+    return envUrl.trim().replace(/\/+$/, '');
+  }
+  return DEFAULT_PYTHON_BACKEND_URL;
+}
+
+/**
+ * Constructs an absolute API endpoint URL, removing any duplicate slashes.
+ */
+export function buildApiEndpoint(path: string): string {
+  const baseUrl = getBaseApiUrl();
+  const cleanPath = path.replace(/^\/+/, '');
+  return `${baseUrl}/${cleanPath}`;
+}
 
 export class EligibilityService {
   /**
-   * Evaluates candidate profile against the targeted role.
-   * Dispatches to remote Python backend if configured,
-   * otherwise runs the deterministic evaluation engine.
+   * Evaluates candidate profile against the targeted role by dispatching to the
+   * Python FastAPI backend with AbortController timeout and robust error parsing.
    */
-  public static async analyzeProfile(profile: CandidateProfile): Promise<EligibilityAnalysisResult> {
-    const startTime = performance.now();
+  public static async analyzeProfile(
+    profile: CandidateProfile,
+    signal?: AbortSignal
+  ): Promise<EligibilityAnalysisResult> {
+    const endpoint = buildApiEndpoint('/api/v1/evaluate-eligibility');
 
-    // 1. If remote Python backend URL is supplied, attempt live HTTP fetch
-    if (PYTHON_API_URL) {
-      try {
-        const response = await fetch(`${PYTHON_API_URL}/api/v1/evaluate-eligibility`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-          },
-          body: JSON.stringify(profile)
-        });
+    // 45s timeout to comfortably accommodate Render free-tier cold-start wakeups
+    const internalController = new AbortController();
+    const timeoutDuration = 45000;
+    let timedOut = false;
 
-        if (response.ok) {
-          const remoteData = await response.json();
-          return remoteData as EligibilityAnalysisResult;
-        }
-      } catch {
-        // Fall through to local evaluator fallback
+    const timerId = setTimeout(() => {
+      timedOut = true;
+      internalController.abort();
+    }, timeoutDuration);
+
+    // If caller provided an external signal, propagate abort
+    if (signal) {
+      if (signal.aborted) {
+        internalController.abort();
+      } else {
+        signal.addEventListener('abort', () => internalController.abort(), { once: true });
       }
     }
 
-    // 2. Local benchmark evaluation engine (simulates Python backend execution)
-    await new Promise((resolve) => setTimeout(resolve, 850));
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify(profile),
+        signal: internalController.signal
+      });
 
+      clearTimeout(timerId);
+
+      if (!response.ok) {
+        let errorMessage = 'The evaluation server returned an error.';
+        try {
+          const contentType = response.headers.get('content-type') || '';
+          if (contentType.includes('application/json')) {
+            const errJson = await response.json();
+            if (errJson?.detail) {
+              errorMessage = typeof errJson.detail === 'string' ? errJson.detail : JSON.stringify(errJson.detail);
+            } else if (errJson?.message) {
+              errorMessage = errJson.message;
+            }
+          }
+        } catch {
+          // Ignore parsing failure and keep friendly error message
+        }
+
+        if (response.status === 400 || response.status === 422) {
+          throw new Error(`Profile validation failed: ${errorMessage}`);
+        } else if (response.status >= 500) {
+          throw new Error('The evaluation service encountered an internal error. Please try again.');
+        } else {
+          throw new Error('Unable to complete the eligibility analysis right now. Please try again.');
+        }
+      }
+
+      // Safe JSON response parsing
+      let remoteData: unknown;
+      try {
+        remoteData = await response.json();
+      } catch {
+        throw new Error('Received an unparseable response from the evaluation service. Please retry.');
+      }
+
+      const parsed = remoteData as EligibilityAnalysisResult;
+      if (!parsed || !parsed.scores || !parsed.targetRole) {
+        throw new Error('Invalid response structure received from evaluation service.');
+      }
+
+      return parsed;
+    } catch (err: unknown) {
+      clearTimeout(timerId);
+
+      if (timedOut) {
+        throw new Error('Request timed out. The evaluation service took too long to respond. Please try again.');
+      }
+
+      const error = err as Error;
+      if (error?.name === 'AbortError') {
+        throw new Error('Request was cancelled. Please try again.');
+      }
+
+      if (error instanceof TypeError && error.message.includes('fetch')) {
+        throw new Error('Network connection error. Please verify your internet connection and try again.');
+      }
+
+      // Preserve clean, safe user message
+      throw new Error(error?.message || 'Unable to complete the eligibility analysis right now. Please try again.');
+    }
+  }
+
+  /**
+   * Deterministic local evaluation engine.
+   * Preserved for offline scenarios, unit tests, or edge fallback.
+   */
+  public static evaluateLocally(profile: CandidateProfile): EligibilityAnalysisResult {
+    const startTime = performance.now();
     const role = JOB_ROLES[profile.targetRole] || JOB_ROLES['software-developer'];
     const candidateSkillsNormalized = profile.technicalSkills.map((s) => s.trim().toLowerCase());
     
@@ -75,7 +172,7 @@ export class EligibilityService {
       }
     });
 
-    // Check bonus skills (candidate skills that are relevant tech but not strictly in role specification)
+    // Check bonus skills
     profile.technicalSkills.forEach((candSkill) => {
       const isInRole = role.keySkills.concat(role.niceToHaveSkills).some(
         (rs) => rs.toLowerCase() === candSkill.toLowerCase()
@@ -106,7 +203,6 @@ export class EligibilityService {
       educationScore = 65;
     }
 
-    // Branch alignment adjustment
     const branchLower = profile.branch.toLowerCase();
     const isTechBranch = role.preferredBranches.some((pb) => branchLower.includes(pb.toLowerCase()));
     if (isTechBranch) {
@@ -133,10 +229,8 @@ export class EligibilityService {
     const cgpaClean = profile.cgpa.replace(/[^0-9.]/g, '');
     const cgpaVal = parseFloat(cgpaClean) || 7.5;
     if (cgpaVal <= 10) {
-      // Scale of 10
       academicsScore = Math.round(Math.min(Math.max((cgpaVal / 10) * 100, 50), 100));
     } else if (cgpaVal <= 100) {
-      // Percentage scale
       academicsScore = Math.round(Math.min(Math.max(cgpaVal, 50), 100));
     }
 
@@ -144,7 +238,6 @@ export class EligibilityService {
     const certsCount = profile.certifications.filter((c) => c.trim().length > 0).length;
     const certBonus = Math.min(certsCount * 3, 10);
 
-    // Aggregate weighted score
     const weightedScoreRaw = (
       skillsScore * 0.50 +
       educationScore * 0.20 +
@@ -163,7 +256,6 @@ export class EligibilityService {
       tier = 'Partially Eligible';
     }
 
-    // Synthesize actionable recommendations
     const recommendations: ActionRecommendation[] = [];
 
     if (missingSkills.length > 0) {
@@ -197,13 +289,12 @@ export class EligibilityService {
         priority: 'Medium',
         category: 'Certification',
         title: `Attain Industry Standard Credential in ${role.title}`,
-        description: `Validated credentials (such as AWS, GCP, or recognized domain specializations) substantiate technical rigor for candidate screening.`,
+        description: `Validated credentials substantiate technical rigor for candidate screening.`,
         impact: '+8% Recruiter Inbound',
         estimatedEffort: '3–4 Weeks'
       });
     }
 
-    // Default general recommendation if candidate is already strong
     if (recommendations.length < 3) {
       recommendations.push({
         id: 'rec-interview-prep',
@@ -216,14 +307,13 @@ export class EligibilityService {
       });
     }
 
-    // Verdict summary text
     let verdictSummary = '';
     if (tier === 'Highly Eligible') {
       verdictSummary = `${profile.fullName || 'Candidate'} exhibits a strong profile alignment for ${role.title}. Core technical proficiencies and educational background firmly meet standard enterprise hiring benchmarks.`;
     } else if (tier === 'Eligible') {
       verdictSummary = `${profile.fullName || 'Candidate'} satisfies the primary qualifications for ${role.title}. Addressing ${missingSkills.length} key skill gaps will elevate profile visibility into top screening percentiles.`;
     } else if (tier === 'Partially Eligible') {
-      verdictSummary = `${profile.fullName || 'Candidate'} demonstrates solid foundational skills, but requires focused enhancement in role-critical competencies (${missingSkills.slice(0, 2).map((m) => m.name).join(', ')}) before applying.`;
+      verdictSummary = `${profile.fullName || 'Candidate'} demonstrates solid foundational skills, but requires focused enhancement in role-critical competencies before applying.`;
     } else {
       verdictSummary = `Significant skill and domain experience gaps identified for ${role.title}. We recommend completing foundational training modules before applying.`;
     }
@@ -231,7 +321,7 @@ export class EligibilityService {
     const latencyMs = Math.round(performance.now() - startTime);
 
     return {
-      evaluationId: `eval-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 6)}`,
+      evaluationId: `eval-local-${Date.now().toString(36)}`,
       timestamp: new Date().toISOString(),
       candidate: {
         fullName: profile.fullName || 'Anonymous Candidate',
@@ -262,7 +352,7 @@ export class EligibilityService {
       verdictSummary,
       backendContract: {
         apiVersion: 'v1.4.2-py',
-        engine: 'Role-Vector-Engine-Python',
+        engine: 'Role-Vector-Engine-Local',
         latencyMs
       }
     };
